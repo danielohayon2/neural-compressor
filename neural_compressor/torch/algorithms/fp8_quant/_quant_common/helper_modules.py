@@ -356,7 +356,8 @@ class PatchedLinearAllReduce(PatchedModuleBase):
 
     def forward_measure(self, input):
         measure_input((input,), observer=self._mod_extra_config.inputs)
-        output = torch.matmul(input, self.weight.transpose(-1, -2))
+        # output = torch.matmul(input, self.weight.transpose(-1, -2))
+        output, output_bias = self.orig_mod(input)
         measure_output((output,), self._mod_extra_config.outputs)
         # in scoped version all reduce is being called outside of the layer
         if not self.scoped_version:
@@ -472,8 +473,10 @@ class PatchedColumnParallelLinear(PatchedModuleBase):
         return self.post_all_reduce(dqoutput)
 
     def forward_measure(self, input):
+        # breakpoint()
         measure_input((input,), observer=self._mod_extra_config.inputs)
-        output = torch.matmul(input, self.weight.transpose(-1, -2))
+        output, output_bias = self.orig_mod(input)
+        # output = torch.matmul(input, self.weight.transpose(-1, -2))
         measure_output((output,), self._mod_extra_config.outputs)
         if self.gather_output:
             output = self.collective_func(output)

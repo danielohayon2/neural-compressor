@@ -110,6 +110,72 @@ def prepare_model(model, mod_list=None):
     register_patched_measure_modules(model, mod_list, observer_class, d_shapes)
 
 
+def pad_weight(weight, block_size):
+    """Pads a matrix to make its dimensions multiples of block_size."""
+    M, N = weight.shape[-2:]
+    block_size_m, block_size_n = block_size
+    pad_M = (block_size_m - M % block_size_m) % block_size_m
+    pad_N = (block_size_n - N % block_size_n) % block_size_n
+
+    if pad_M == 0 and pad_N == 0:
+        return weight, M, N  # No padding needed
+    padded_weight = torch.nn.functional.pad(weight, (0, pad_N, 0, pad_M), mode='constant', value=0)
+    padded_weight = torch.nn.Parameter(padded_weight, requires_grad=False)
+    return padded_weight, M, N  # Return original dimensions for unpadding
+
+def unpad_weight(weight, original_M, original_N, keep_first_dim=False):
+    """Removes padding from the matrix to restore its original shape."""
+    if keep_first_dim:
+        return weight[:, :original_M, :original_N]
+    else:
+        return weight[:original_M, :original_N]
+
+def pad_block_fp8_weight_naive(weight, weight_scale, block_size):
+
+    assert len(block_size) == 2
+
+    block_size_m, block_size_n = block_size
+    weight_scale_m, weight_scale_n = weight_scale.shape[-2:]
+
+    weight, orig_M, orig_N = pad_weight(weight, block_size)
+    M, N = weight.shape[-2:]
+
+    assert weight_scale_m == M // block_size_m
+    assert weight_scale_n == N // block_size_n
+
+    return weight, orig_M, orig_N
+
+
+def dequant_block_fp8_weight_naive(weight, weight_scale, block_size, dtype, original_M, original_N):
+
+    assert len(block_size) == 2
+    
+    weight_shape_len = len(weight.shape)
+
+    block_size_m, block_size_n = block_size
+
+    # mul scale
+    if weight_shape_len == 2:
+        weight_scale_m, weight_scale_n = weight_scale.shape
+        weight_scale = weight_scale.view(weight_scale_m, 1, weight_scale_n, 1)
+        weight = weight.view(weight_scale_m, block_size_m, weight_scale_n, block_size_n)
+        dequant_weight = weight.to(dtype) * weight_scale.to(dtype)
+        dequant_weight = dequant_weight.view(weight_scale_m*block_size_m, weight_scale_n*block_size_n)
+        keep_first_dim = False
+    elif weight_shape_len == 3:
+        fd, weight_scale_m, weight_scale_n = weight_scale.shape
+        weight_scale = weight_scale.view(fd, weight_scale_m, 1, weight_scale_n, 1)
+        weight = weight.view(fd, weight_scale_m, block_size_m, weight_scale_n, block_size_n)
+        dequant_weight = weight.to(dtype) * weight_scale.to(dtype)
+        dequant_weight = dequant_weight.view(fd, weight_scale_m*block_size_m, weight_scale_n*block_size_n)
+        keep_first_dim = True
+    else:
+        raise ValueError("Only support original weight shape is either 2 or 3")
+
+    dequant_weight = unpad_weight(dequant_weight, original_M, original_N, keep_first_dim=keep_first_dim)
+
+    return dequant_weight
+
 def register_patched_measure_modules(model, mod_list, observer_class, d_shapes=None):
     """Replace the submodules of the model that appear in mod_list with a patched submodule that uses the given observer_class
     so the submodule will perform measurement on inputs/outputs in forward stage.
@@ -130,6 +196,12 @@ def register_patched_measure_modules(model, mod_list, observer_class, d_shapes=N
     with torch.no_grad():
         for name, mod in model.named_modules():
             if (name in mod_list) or (mod_list is None):
+                print(name)
+                old_weights = mod.weight
+                mod.weight, orig_M, orig_N = pad_block_fp8_weight_naive(mod.weight,mod.weight_scale_inv, mod.quant_method.quant_config.weight_block_size)
+                dequantized_w = dequant_block_fp8_weight_naive(mod.weight, mod.weight_scale_inv, mod.quant_method.quant_config.weight_block_size, torch.bfloat16, orig_M, orig_N)
+                mod.weight = torch.nn.Parameter(dequantized_w, requires_grad=False)
+
                 IMOD_DICT[mod] = name
                 mod_type_str = mod.__class__.__name__
                 mod_type = config["mod_dict"][mod_type_str]
@@ -166,6 +238,10 @@ def register_patched_measure_modules(model, mod_list, observer_class, d_shapes=N
                 if observer_class == OBSERVER_TYPES["save"]:
                     save_module(pmod)
                 patched_modules.append(name)
+                mod.weight = old_weights
+                pmod.weight = old_weights
+                pmod.weight_scale_inv = mod.weight_scale_inv
+                pmod.quant_method = mod.quant_method
             else:
                 non_patched_types.add(type(mod))
     logger.debug("Patched module types: %s", patched_types)
